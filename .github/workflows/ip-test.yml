@@ -1,0 +1,24 @@
+name: Datacenter IP test
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Runner public IP
+        run: curl -s --max-time 15 https://ipinfo.io/json || echo "(ipinfo unavailable)"
+
+      - name: Install dependencies
+        run: pip install -q requests beautifulsoup4 lxml "httpx[http2]" curl_cffi brotli
+
+      - name: Run the diagnostic
+        run: python deploy/diagnose.py
