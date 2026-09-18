@@ -1,0 +1,10 @@
+# SUPERSEDED -- do not use this file.
+#
+# It has moved and been split in two:
+#
+#   deploy/workflows/ip-test.yml   run this FIRST -- proves whether the fetch
+#                                  technique works from a GitHub runner at all
+#   deploy/workflows/monitor.yml   the actual monitor, with state persistence,
+#                                  secret handling and a leaked-secret guard
+#
+# See deploy/HOSTING.md for the order to do things in and what becomes public.
