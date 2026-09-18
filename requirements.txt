@@ -1,0 +1,17 @@
+requests>=2.31
+beautifulsoup4>=4.12
+
+# --- getting past eBay's bot management -------------------------------------
+# eBay sits behind Akamai Bot Manager, which fingerprints TLS as well as headers.
+# Plain requests has a Python TLS signature and can get an instant 403.
+# Run deploy/diagnose.py to find out which client this machine needs, then set
+# EBAY_HTTP_CLIENT accordingly. Install these to give the diagnostic something
+# to test -- the monitor auto-selects the best one available.
+curl_cffi>=0.7          # impersonates Chrome's JA3/TLS fingerprint -- usually the fix
+httpx[http2]>=0.27      # HTTP/2, in case h2 alone is enough
+brotli>=1.1             # so we can honestly advertise Accept-Encoding: br
+
+# Optional but recommended: a faster, more forgiving HTML parser.
+# eBay serves unquoted attributes and unclosed tags; lxml handles them best.
+# The script falls back to Python's built-in html.parser if this isn't installed.
+lxml>=5.0
