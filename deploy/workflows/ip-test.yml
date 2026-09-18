@@ -1,0 +1,47 @@
+# ONE-SHOT TEST -- does the working fetch technique survive a datacenter IP?
+#
+# This is the experiment, not the monitor. It runs deploy/diagnose.py on a GitHub
+# runner and prints which request variants get real results from GitHub's IPs.
+# It needs no secrets and sends nothing to Discord.
+#
+# Install:
+#   1. Create a repo (public -- see deploy/HOSTING.md on why) and push this folder
+#   2. Copy this file to .github/workflows/ip-test.yml
+#   3. GitHub > Actions tab > "Datacenter IP test" > Run workflow
+#   4. Open the run, expand "Run the diagnostic", paste the output back
+#
+# Takes about a minute. Nothing else in the repo runs on a schedule yet.
+
+name: Datacenter IP test
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Show the runner's public IP and where it lives
+        run: |
+          echo "Runner public IP / network:"
+          curl -s --max-time 15 https://ipinfo.io/json || echo "(ipinfo unavailable)"
+          echo
+
+      - name: Install dependencies
+        run: pip install -q requests beautifulsoup4 lxml "httpx[http2]" curl_cffi brotli
+
+      - name: Run the diagnostic
+        run: python deploy/diagnose.py
+
+      # diagnose.py exits 0 regardless so the log is always readable; the verdict
+      # line at the bottom is the answer. Read it, don't rely on the job's status.
+      - name: Reminder
+        if: always()
+        run: echo "Read the WINNER / NOTHING WORKED verdict at the end of the step above."

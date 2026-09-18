@@ -1,0 +1,91 @@
+# The monitor, running on GitHub's servers.
+#
+# DO NOT install this until deploy/workflows/ip-test.yml has proven that the
+# fetch technique works from a GitHub runner. If it doesn't, this will run every
+# 10 minutes forever and never alert. See deploy/HOSTING.md.
+#
+# Install:
+#   1. Public repo (see HOSTING.md for why, and what becomes public)
+#   2. Copy to .github/workflows/monitor.yml
+#   3. Settings > Secrets and variables > Actions > New repository secret
+#        DISCORD_WEBHOOK_URL = https://discord.com/api/webhooks/...
+#   4. Settings > Actions > General > Workflow permissions > Read and write
+#   5. Commit a seeded seen_items.json so the first run is silent
+#
+# NEVER commit .env. It is gitignored, and the guard step below fails the run if
+# it ever slips through.
+
+name: eBay listing monitor
+
+on:
+  schedule:
+    # GitHub's minimum is 5 minutes, but scheduled runs are routinely delayed
+    # 10-40 minutes under load. Asking for */5 mostly buys unpredictability and
+    # overlapping runs, so */10 is honest about what you actually get.
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: ebay-monitor          # two runs must never race on seen_items.json
+  cancel-in-progress: false
+
+permissions:
+  contents: write              # to commit seen_items.json back
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refuse to run if a secret got committed
+        run: |
+          if git ls-files --error-unmatch .env >/dev/null 2>&1; then
+            echo "::error::.env is tracked in git. In a public repo that publishes your"
+            echo "::error::Discord webhook. Remove it (git rm --cached .env), rotate the"
+            echo "::error::webhook in Discord, and push again."
+            exit 1
+          fi
+          # Match real webhooks only (17-20 digit id + long token), so the
+          # deliberately fake ones in tests/ don't cause false alarms.
+          if git grep -qIE 'discord(app)?\.com/api/webhooks/[0-9]{17,20}/[A-Za-z0-9_-]{50,}' -- . 2>/dev/null; then
+            echo "::error::A real Discord webhook URL appears in a tracked file."
+            git grep -lIE 'discord(app)?\.com/api/webhooks/[0-9]{17,20}/[A-Za-z0-9_-]{50,}' -- . || true
+            exit 1
+          fi
+          echo "No secrets in tracked files."
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Poll eBay and alert on new listings
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          # Each scheduled run is a fresh process, so "3 consecutive failures"
+          # can never accumulate. One failed run is the only signal available.
+          EBAY_ALERT_AFTER_FAILURES: "1"
+        run: python ebay_monitor.py --once
+
+      - name: Persist seen items
+        if: always()           # record what we saw even if a later step fails
+        run: |
+          if [[ -z "$(git status --porcelain seen_items.json)" ]]; then
+            echo "No state change."
+            exit 0
+          fi
+          git config user.name  "ebay-monitor[bot]"
+          git config user.email "ebay-monitor@users.noreply.github.com"
+          git add seen_items.json
+          git commit -m "chore: seen listings $(date -u +%Y-%m-%dT%H:%MZ) [skip ci]"
+          # Another run may have pushed while we were polling.
+          for i in 1 2 3; do
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" && git push && exit 0
+            echo "push race, retrying ($i/3)"
+            sleep 5
+          done
+          echo "::warning::Could not push state; next run may re-alert on these items."
