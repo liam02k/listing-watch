@@ -99,10 +99,41 @@ _load_env_file(Path(__file__).resolve().parent / ".env")
 #              listings -- it hid a $2,000 Undertaker SLAMMED insert that was
 #              filed under a different category. Searching all categories costs
 #              nothing here: the query is precise enough on its own.
+#   -digital   the Topps *Slam* phone app resells as "DIGITAL ... 10cc/50cc"
+#              listings for a few dollars. Verified empirically on 2026-09-19:
+#              adding -digital returned the identical 9 item IDs, so it costs
+#              nothing in recall and pre-empts cheap noise once auctions are
+#              allowed to alert below the price floor.
 SEARCH_URL = os.getenv(
     "EBAY_SEARCH_URL",
-    "https://www.ebay.com/sch/i.html?_nkw=wwe+universe+slammed+-slammer&_sop=10",
+    "https://www.ebay.com/sch/i.html?_nkw=wwe+universe+slammed+-slammer+-digital&_sop=10",
 )
+
+# A live auction's CURRENT BID is not its value. A CASE HIT SSP sitting at $41
+# with two bids is exactly the thing worth knowing about, and by the time it
+# climbs past the floor on its own it is too late to act. So auctions are judged
+# on the title's value signals instead of the current bid; Buy It Now keeps the
+# floor, which is what suppresses cheap tat.
+VALUE_SIGNAL_RE = re.compile(
+    r"""(?xi)
+    \bSSP\b | \bCASE\s*HIT\b | \bSUPER\s*SHORT\s*PRINT\b
+    | \b(?:ULTRA|SUPER)\s+RARE\b
+    | \bSHORT\s*PRINT\b | (?<![A-Z])SP(?![A-Z])
+    | \b1\s*[/of]{1,2}\s*1\b                 # 1/1, 1 of 1
+    | /\s?(?:\d{1,3})\b                      # /99, /25, numbered parallels
+    | \bAUTO(?:GRAPH)?\b | \bPATCH\b | \bRELIC\b
+    """
+)
+
+# Never alert on these however cheap or expensive -- belt and braces behind the
+# -digital search term, because the auction rule deliberately drops the floor.
+DIGITAL_RE = re.compile(r"(?i)\bdigital\b|\*digital\*|\b\d+\s?cc\b|\btopps\s+slam\b")
+
+# A price DROP this large (absolute or percent) is worth a second alert. Rises
+# are not alerted -- auctions rise by design and would ping on every bid -- except
+# for the single "crossed your floor" event below.
+PRICE_DROP_MIN_ABS = float(os.getenv("EBAY_PRICE_DROP_MIN_ABS", "25"))
+PRICE_DROP_MIN_PCT = float(os.getenv("EBAY_PRICE_DROP_MIN_PCT", "10"))
 
 # Alert on listings priced AT OR ABOVE this (in the listing's own currency).
 # $45.00 exactly qualifies. There is deliberately no upper bound -- however
@@ -129,8 +160,12 @@ MAX_ALERTS_PER_CYCLE = int(os.getenv("EBAY_MAX_ALERTS_PER_CYCLE", "10"))
 
 # After this many consecutive failed polls, post ONE warning to Discord. Silence is
 # indistinguishable from "nothing new", so a monitor that quietly stops working is
-# the real danger -- especially if you run it somewhere eBay soft-blocks. Set to 0
-# to disable. A single recovery message is sent when polling starts working again.
+# the real danger. Set to 0 to disable. A recovery message follows when it clears.
+#
+# The count is PERSISTED in the state file, not held in memory. That matters: under
+# `--once` (cron, GitHub Actions) every poll is a fresh process, so an in-memory
+# counter could never exceed 1 -- and setting this to 2 or 3 would have silently
+# disabled health alerts altogether rather than making them less twitchy.
 ALERT_AFTER_FAILURES = int(os.getenv("EBAY_ALERT_AFTER_FAILURES", "3"))
 
 # Forget seen IDs older than this many days (keeps the state file small).
@@ -162,6 +197,10 @@ WARM_MAX_AGE = int(os.getenv("EBAY_WARM_MAX_AGE", "1800"))  # 30 minutes
 # Pause between the warm-up request and the search, so it looks like a person
 # landing on the homepage and then searching rather than two instant hits.
 WARM_PAUSE = float(os.getenv("EBAY_WARM_PAUSE", "1.5"))
+
+# Pause before escalating to a different HTTP client after a block. Short-lived
+# IP-reputation blocks often clear on their own, so the wait is doing real work.
+RETRY_PAUSE = float(os.getenv("EBAY_RETRY_PAUSE", "20"))
 
 DISCORD_USERNAME = os.getenv("DISCORD_USERNAME", "eBay Watch")
 EMBED_COLOR = int(os.getenv("DISCORD_EMBED_COLOR", "0x0064D2"), 0)  # eBay blue
@@ -221,6 +260,15 @@ class Listing:
     listed_at: str = ""
     is_new_listing: bool = False
     extras: list[str] = field(default_factory=list)
+    is_auction: bool = False
+    bid_count: int | None = None
+
+    def is_digital(self) -> bool:
+        return bool(DIGITAL_RE.search(self.title))
+
+    def value_signal(self) -> str:
+        m = VALUE_SIGNAL_RE.search(self.title)
+        return m.group(0).strip() if m else ""
 
     def summary(self) -> str:
         bits = [self.price_text or "?", self.title[:70]]
@@ -344,6 +392,10 @@ def _parse_card(card) -> Listing | None:
         if m:
             seller = m.group(1)
 
+    bid_m = re.match(r"^(\d+)\s+bids?\b", buying_format or "", re.I)
+    is_auction = bool(bid_m)
+    bid_count = int(bid_m.group(1)) if bid_m else None
+
     used = {buying_format, shipping, location, listed_at, feedback, seller}
     extras = [r for r in rows if r not in used and "% positive" not in r][:3]
 
@@ -365,6 +417,8 @@ def _parse_card(card) -> Listing | None:
         listed_at=listed_at,
         is_new_listing=is_new,
         extras=extras,
+        is_auction=is_auction,
+        bid_count=bid_count,
     )
 
 
@@ -676,27 +730,64 @@ def _validate_search_response(resp, fetcher: "Fetcher", url: str) -> str:
     return html
 
 
-def fetch_search_html(fetcher: "Fetcher", url: str) -> str:
-    """GET the search page, re-warming the session once if it looks blocked.
+def _client_escalation(current: str) -> list[str]:
+    """Other clients to try, in order, after the current one gets blocked."""
+    return [k for k in ("requests", "httpx", "curl_cffi") if k != current]
 
-    Akamai's cookies expire, and a process polling every 5 minutes for days will
-    outlive them. Rather than wait for the health alert to tell us, a block gets
-    one automatic recovery attempt: bin the cookie jar, warm up again, retry.
+
+def fetch_search_html(fetcher: "Fetcher", url: str) -> str:
+    """GET the search page, escalating through recovery attempts before giving up.
+
+    Observed behaviour: a 403 here is usually the *runner's IP* being in poor
+    standing with Akamai at that moment, not a durable block. GitHub hands out a
+    different IP per run, and the identical technique that 403s on one IP returns
+    a full results page on another minutes later. So a single 403 is not evidence
+    that anything is broken, and bailing out on it throws away a poll for nothing.
+
+    Escalation, cheapest first:
+      1. the warm session we already have
+      2. same client, cookie jar binned and re-warmed  (fixes stale cookies)
+      3. a different HTTP client, after a pause         (different TLS/HTTP stack,
+         and the pause alone often outlasts a short-lived block)
+
+    Only when all of those fail do we call it a soft block.
     """
     fetcher.warm_up()
     try:
         return _validate_search_response(fetcher.get(url), fetcher, url)
     except SoftBlockError as first:
-        log.warning("Search looked blocked (%s)", first)
-        log.info("Dropping cookies and re-warming the session, then retrying once")
-        fetcher.reset()
-        fetcher.warm_up(force=True)
-        try:
-            html = _validate_search_response(fetcher.get(url), fetcher, url)
-        except SoftBlockError as second:
-            raise SoftBlockError(f"{second} (still blocked after a re-warm)") from second
-        log.info("Re-warm worked -- the cookie jar had simply gone stale")
+        log.warning("Attempt 1 blocked (%s)", first)
+        last = first
+
+    log.info("Attempt 2: dropping cookies and re-warming the %s client", fetcher.kind)
+    fetcher.reset()
+    fetcher.warm_up(force=True)
+    try:
+        html = _validate_search_response(fetcher.get(url), fetcher, url)
+        log.info("Recovered on attempt 2 -- the cookie jar had gone stale")
         return html
+    except SoftBlockError as second:
+        log.warning("Attempt 2 blocked (%s)", second)
+        last = second
+
+    for n, kind in enumerate(_client_escalation(fetcher.kind), start=3):
+        log.info("Waiting %ds, then attempt %d with the %s client", RETRY_PAUSE, n, kind)
+        time.sleep(RETRY_PAUSE)
+        try:
+            alt = Fetcher(kind)
+        except Exception as exc:
+            log.info("  %s client unavailable (%s) -- skipping", kind, exc)
+            continue
+        alt.warm_up(force=True)
+        try:
+            html = _validate_search_response(alt.get(url), alt, url)
+            log.info("Recovered on attempt %d using the %s client", n, kind)
+            return html
+        except SoftBlockError as exc:
+            log.warning("Attempt %d (%s) blocked (%s)", n, kind, exc)
+            last = exc
+
+    raise SoftBlockError(f"{last} (every client blocked, after retries)")
 
 
 # ---------------------------------------------------------------------------
@@ -704,35 +795,79 @@ def fetch_search_html(fetcher: "Fetcher", url: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+STATE_VERSION = 2
+
+
+def _record_first_seen(rec: Any) -> str:
+    """first_seen timestamp out of either state format."""
+    return rec if isinstance(rec, str) else (rec or {}).get("first_seen", "")
+
+
+def migrate_state(data: dict[str, Any]) -> dict[str, Any]:
+    """Bring a v1 state file up to v2, in place and without losing anything.
+
+    v1: {"seen": {"123": "2026-09-18T16:00:20+00:00"}}
+    v2: {"seen": {"123": {"first_seen": "...", "price": null, "crossed": false}}}
+
+    A botched migration is one of the few ways this monitor can fail silently and
+    badly: drop the IDs and it re-alerts on everything; mangle them and it alerts
+    on nothing ever again. So v1 records are widened, never discarded, and an
+    unknown price is recorded as null rather than guessed -- a null price simply
+    means "no price-change baseline yet", which the first poll then fills in.
+    """
+    seen = data.get("seen") or {}
+    migrated = 0
+    for item_id, rec in list(seen.items()):
+        if isinstance(rec, str):
+            seen[item_id] = {"first_seen": rec, "price": None,
+                             "price_text": "", "crossed": False}
+            migrated += 1
+        elif isinstance(rec, dict):
+            rec.setdefault("first_seen", "")
+            rec.setdefault("price", None)
+            rec.setdefault("price_text", "")
+            rec.setdefault("crossed", False)
+        else:
+            seen[item_id] = {"first_seen": "", "price": None,
+                             "price_text": "", "crossed": False}
+            migrated += 1
+    if migrated:
+        log.info("Migrated %d item(s) from v1 to v2 state (no IDs dropped)", migrated)
+    data["seen"] = seen
+    data["version"] = STATE_VERSION
+    return data
+
+
 def load_state(path: Path) -> dict[str, Any]:
     if not path.exists():
-        return {"version": 1, "seen": {}}
+        return {"version": STATE_VERSION, "seen": {}}
     try:
         data = json.loads(path.read_text("utf-8"))
         if isinstance(data, dict) and isinstance(data.get("seen"), dict):
-            return data
+            return migrate_state(data)
         if isinstance(data, list):  # tolerate a bare list of IDs
             now = datetime.now(timezone.utc).isoformat()
-            return {"version": 1, "seen": {str(i): now for i in data}}
+            return migrate_state({"version": 1, "seen": {str(i): now for i in data}})
     except (json.JSONDecodeError, OSError) as exc:
         log.warning("State file %s is unreadable (%s) -- starting fresh, backing it up", path, exc)
         try:
             path.replace(path.with_suffix(path.suffix + ".corrupt"))
         except OSError:
             pass
-    return {"version": 1, "seen": {}}
+    return {"version": STATE_VERSION, "seen": {}}
 
 
 def save_state(path: Path, state: dict[str, Any]) -> None:
     """Atomic write, so a crash mid-save can't leave a truncated state file."""
     cutoff = time.time() - STATE_RETENTION_DAYS * 86400
     pruned = {}
-    for item_id, ts in state.get("seen", {}).items():
+    for item_id, rec in state.get("seen", {}).items():
+        ts = _record_first_seen(rec)
         try:
             if datetime.fromisoformat(ts).timestamp() >= cutoff:
-                pruned[item_id] = ts
+                pruned[item_id] = rec
         except (TypeError, ValueError):
-            pruned[item_id] = ts
+            pruned[item_id] = rec       # unparseable timestamp: keep, never drop
     state["seen"] = pruned
     state["updated_at"] = datetime.now(timezone.utc).isoformat()
 
@@ -755,12 +890,16 @@ def _field(name: str, value: str, inline: bool = True) -> dict[str, Any] | None:
     return {"name": name, "value": value[:1024], "inline": inline} if value else None
 
 
-def build_embed(listing: Listing) -> dict[str, Any]:
+def build_embed(listing: Listing, reason: str = "") -> dict[str, Any]:
     desc_bits = []
     if listing.price_text:
         desc_bits.append(f"**{listing.price_text}**")
     if listing.buying_format:
         desc_bits.append(listing.buying_format)
+    if reason and reason != "new listing":
+        # Say why this one made it through -- especially for a sub-floor auction,
+        # where otherwise it just looks like the price filter is broken.
+        desc_bits.append(f"\n{reason}")
 
     seller = listing.seller
     if seller and listing.seller_feedback:
@@ -790,11 +929,13 @@ def build_embed(listing: Listing) -> dict[str, Any]:
     return embed
 
 
-def build_discord_payload(listings: Iterable[Listing]) -> dict[str, Any]:
+def build_discord_payload(listings: Iterable[Listing],
+                          reasons: dict[str, str] | None = None) -> dict[str, Any]:
     """Discord allows up to 10 embeds per message."""
+    reasons = reasons or {}
     return {
         "username": DISCORD_USERNAME,
-        "embeds": [build_embed(l) for l in list(listings)[:10]],
+        "embeds": [build_embed(l, reasons.get(l.item_id, "")) for l in list(listings)[:10]],
     }
 
 
@@ -908,16 +1049,43 @@ def send_discord(session: requests.Session, webhook: str, payload: dict[str, Any
 
 
 def qualifies(listing: Listing, threshold: float) -> bool:
-    """True when the listing's whole price range is at or above the threshold.
+    """Should this listing be alerted on? Returns True/False; see why() for the reason.
 
-    The comparison is inclusive: with the default threshold of 45, a listing at
-    exactly $45.00 qualifies. There is no upper bound by design -- a $5,000 card
-    alerts just like a $45 one.
+    Two different tests, because a price floor means different things to the two
+    selling formats:
 
-    For a multi-variation range ("$45.00 to $90.00") we use the LOW end, so a
-    range only qualifies if every variation clears the bar.
+      Buy It Now   price >= threshold. The asking price IS the price, so the floor
+                   is meaningful and it's what keeps cheap tat out.
+
+      Auction      price >= threshold OR the title carries a value signal
+                   (SSP, CASE HIT, /99, auto, relic...). An auction's current bid
+                   says nothing about what the card is worth -- everything opens
+                   at a dollar. Waiting for the bid to cross the floor means
+                   hearing about it only once it's already expensive.
+
+    Digital listings never qualify, at any price, by either route.
+
+    Ranges ("$45.00 to $90.00") use the LOW end, so a range only clears the floor
+    when every variation does.
     """
-    return listing.price is not None and listing.price >= threshold
+    return bool(why_it_qualifies(listing, threshold))
+
+
+def why_it_qualifies(listing: Listing, threshold: float) -> str:
+    """The human-readable reason a listing qualifies, or "" if it doesn't."""
+    if listing.price is None:
+        return ""
+    if listing.is_digital():
+        return ""
+    if listing.price >= threshold:
+        return f"${listing.price:,.2f} is at or above your ${threshold:,.0f} floor"
+    if listing.is_auction:
+        signal = listing.value_signal()
+        if signal:
+            bids = f"{listing.bid_count} bid{'s' if listing.bid_count != 1 else ''}"
+            return (f"auction at {listing.price_text} ({bids}) — under your floor, but "
+                    f"the title says **{signal}**")
+    return ""
 
 
 def run_cycle(session: requests.Session, state: dict[str, Any], args,
@@ -963,9 +1131,47 @@ def run_cycle(session: requests.Session, state: dict[str, Any], args,
         for l in listings:
             mark = "NEW " if l.item_id not in seen else "    "
             over = ">" if qualifies(l, args.threshold) else " "
-            log.info("  %s%s %s", mark, over, l.summary())
+            kind = "auction" if l.is_auction else "BIN"
+            log.info("  %s%s [%s] %s", mark, over, kind, l.summary())
 
-    matches = fresh if args.no_filter else [l for l in fresh if qualifies(l, args.threshold)]
+    # --- what deserves an alert this cycle -------------------------------------
+    # Three distinct events, not just "is it new":
+    #   NEW      unseen and it qualifies
+    #   DROP     price fell materially on something we're already tracking
+    #   CROSSED  a sub-floor auction has now climbed past the floor (fires once)
+    # Price RISES are otherwise ignored: auctions rise by design and alerting on
+    # every bid would be unusable.
+    events: list[tuple[Listing, str]] = []
+
+    for l in listings:
+        rec = seen.get(l.item_id)
+        reason = why_it_qualifies(l, args.threshold)
+
+        if rec is None:
+            if args.no_filter or reason:
+                events.append((l, reason or "new listing"))
+            continue
+
+        if not isinstance(rec, dict):
+            continue
+        old_price = rec.get("price")
+        if old_price is None or l.price is None:
+            continue
+
+        if l.price < old_price:
+            drop = old_price - l.price
+            pct = (drop / old_price * 100) if old_price else 0
+            if drop >= PRICE_DROP_MIN_ABS or pct >= PRICE_DROP_MIN_PCT:
+                events.append((l, f"price dropped {pct:.0f}% — was "
+                                  f"${old_price:,.2f}, now {l.price_text}"))
+                continue
+
+        if (l.price >= args.threshold > old_price) and not rec.get("crossed"):
+            events.append((l, f"now {l.price_text} — has crossed your "
+                              f"${args.threshold:,.0f} floor"))
+
+    matches = [l for l, _ in events]
+    reasons = {l.item_id: r for l, r in events}
 
     if fresh and first_run and not args.alert_existing:
         log.info("First run: recording %d current listings as seen without alerting "
@@ -979,19 +1185,30 @@ def run_cycle(session: requests.Session, state: dict[str, Any], args,
     sent = 0
     for i in range(0, len(matches), 10):
         batch = matches[i: i + 10]
-        payload = build_discord_payload(batch)
+        payload = build_discord_payload(batch, reasons)
         ok = send_discord(session, args.webhook, payload, dry_run=args.dry_run)
         for l in batch:
-            log.info("%s %s — %s", "ALERT" if ok else "MATCH", l.price_text or "?", l.title[:80])
+            log.info("%s %s — %s  [%s]", "ALERT" if ok else "MATCH",
+                     l.price_text or "?", l.title[:70], reasons.get(l.item_id, ""))
         sent += len(batch)
         if ok and i + 10 < len(matches):
             time.sleep(1)  # be gentle with the webhook
 
-    # Mark everything we saw as seen, whether or not it cleared the price bar, so
-    # a listing never alerts twice. Dry runs don't record, so you can re-test.
+    # Record every listing we saw, with its current price, so the next poll has a
+    # baseline to compare against. Everything is recorded whether or not it
+    # alerted -- that's what stops a listing alerting twice. Dry runs record
+    # nothing, so a dry run can be repeated and still show the same result.
     if not args.dry_run:
         for l in listings:
-            seen.setdefault(l.item_id, now)
+            rec = seen.get(l.item_id)
+            if not isinstance(rec, dict):
+                rec = {"first_seen": _record_first_seen(rec) or now,
+                       "price": None, "price_text": "", "crossed": False}
+                seen[l.item_id] = rec
+            rec["price"] = l.price
+            rec["price_text"] = l.price_text
+            if l.price is not None and l.price >= args.threshold:
+                rec["crossed"] = True
         save_state(args.state_file, state)
     else:
         log.info("Dry run: not updating %s", args.state_file)
@@ -1116,12 +1333,19 @@ def main(argv: list[str] | None = None) -> int:
         try:
             run_cycle(session, state, args, html_override=html_override, fetcher=fetcher)
             last_cycle_ok = True
-            if health_warned:
-                send_discord(session, args.webhook,
-                             build_health_payload(args, consecutive_failures, "", recovered=True),
-                             dry_run=args.dry_run)
-                log.info("Polling recovered after %d failures", consecutive_failures)
-                health_warned = False
+            # Failure bookkeeping lives in the state file so it survives one-shot runs.
+            if state.get("failures") or state.get("health_alerted"):
+                if state.get("health_alerted"):
+                    send_discord(session, args.webhook,
+                                 build_health_payload(args, int(state.get("failures", 0)), "",
+                                                      recovered=True),
+                                 dry_run=args.dry_run)
+                    log.info("Polling recovered after %s failed poll(s)", state.get("failures"))
+                state["failures"] = 0
+                state["health_alerted"] = False
+                if not args.dry_run:
+                    save_state(args.state_file, state)
+            health_warned = False
             backoff = 1
             consecutive_failures = 0
         except SoftBlockError as exc:
@@ -1148,14 +1372,26 @@ def main(argv: list[str] | None = None) -> int:
             last_error = f"{type(exc).__name__}: {exc}"
             log.exception("Unexpected error during poll; continuing")
 
+        # Record the failure durably, so consecutive failures accumulate across
+        # one-shot runs instead of resetting with every fresh process.
+        if not last_cycle_ok:
+            state["failures"] = int(state.get("failures", 0)) + 1
+            if not args.dry_run:
+                save_state(args.state_file, state)
+            log.warning("Failed poll #%s in a row", state["failures"])
+
         # Silence looks exactly like "nothing new", so say so out loud -- once.
-        if (ALERT_AFTER_FAILURES and not health_warned
-                and consecutive_failures >= ALERT_AFTER_FAILURES):
-            log.error("%d consecutive failed polls -- notifying Discord", consecutive_failures)
+        if (ALERT_AFTER_FAILURES and not last_cycle_ok
+                and not state.get("health_alerted")
+                and int(state.get("failures", 0)) >= ALERT_AFTER_FAILURES):
+            log.error("%s consecutive failed polls -- notifying Discord", state["failures"])
             send_discord(session, args.webhook,
-                         build_health_payload(args, consecutive_failures, last_error),
+                         build_health_payload(args, int(state["failures"]), last_error),
                          dry_run=args.dry_run)
+            state["health_alerted"] = True
             health_warned = True
+            if not args.dry_run:
+                save_state(args.state_file, state)
 
         if args.once or _stop:
             break
