@@ -125,6 +125,158 @@ check("default excludes the autocorrect term", "-slammer" in em.SEARCH_URL, em.S
 check("default has no spell_auto_correct param", "_blrs" not in em.SEARCH_URL, em.SEARCH_URL)
 check("default still sorts newest first", "_sop=10" in em.SEARCH_URL, em.SEARCH_URL)
 
+print("\n== Auction vs Buy It Now rules ==")
+AUCTION_FIXTURE = (HERE / "fixture_auction_rules.html").read_text("utf-8")
+auc = em.parse_listings(AUCTION_FIXTURE)
+by_id = {l.item_id: l for l in auc}
+check("all 4 rule-test listings parsed", len(auc) == 4, str(len(auc)))
+
+gunther = by_id.get("298690056229")
+check("the Gunther auction is parsed", gunther is not None)
+if gunther:
+    check("price is $41.00 (under the floor)", gunther.price == 41.0, str(gunther.price))
+    check("recognised as an auction", gunther.is_auction is True)
+    check("bid count parsed", gunther.bid_count == 2, str(gunther.bid_count))
+    check("value signal detected", gunther.value_signal() != "", gunther.value_signal())
+    check("not treated as digital", gunther.is_digital() is False)
+    check("*** ALERTS despite being under the $45 floor ***",
+          em.qualifies(gunther, 45.0) is True,
+          em.why_it_qualifies(gunther, 45.0))
+    check("the reason explains itself to a human",
+          "under your floor" in em.why_it_qualifies(gunther, 45.0).lower(),
+          em.why_it_qualifies(gunther, 45.0))
+    check("old rule would have skipped it (regression guard)", gunther.price < 45.0)
+
+digital = by_id.get("137755192026")
+check("the $6.99 digital BIN is parsed", digital is not None)
+if digital:
+    check("flagged as digital", digital.is_digital() is True)
+    check("*** does NOT alert ***", em.qualifies(digital, 45.0) is False)
+    check("would not alert even if it were an auction with a signal",
+          em.qualifies(em.Listing(item_id="d", title=digital.title + " SSP",
+                                  url="u", price=6.99, is_auction=True), 45.0) is False)
+
+common_bin = by_id.get("900000000001")
+check("$20 plain Buy It Now does NOT alert",
+      common_bin is not None and em.qualifies(common_bin, 45.0) is False)
+common_auc = by_id.get("900000000002")
+check("$12 auction with no value signal does NOT alert",
+      common_auc is not None and em.qualifies(common_auc, 45.0) is False,
+      em.why_it_qualifies(common_auc, 45.0) if common_auc else "")
+check("  (that auction IS recognised as an auction -- it's the signal that's missing)",
+      common_auc is not None and common_auc.is_auction is True
+      and common_auc.value_signal() == "")
+
+print("\n-- value-signal vocabulary --")
+for title, want in [
+    ("2026 Topps Gunther Slammed CASE HIT SSP #S-GU RAW RARE", True),
+    ("Roman Reigns SLAMMED ULTRA RARE SSP", True),
+    ("Undertaker Slammed /99 numbered parallel", True),
+    ("Logan Paul Slammed 1/1 one of one", True),
+    ("Bray Wyatt Slammed AUTO patch relic", True),
+    ("2026 Topps WWE Universe Slammed base card", False),
+    ("Slammed common card Chad Gable near mint", False),
+]:
+    got = bool(em.VALUE_SIGNAL_RE.search(title))
+    check(f"signal {'found' if want else 'absent'}: {title[:46]}", got is want,
+          f"got {got}")
+
+print("\n-- the existing 7 high-value listings still qualify --")
+still = em.parse_listings(SLAMMED)
+for l in still:
+    check(f"still alerts: {l.price_text} {l.title[:40]}", em.qualifies(l, 45.0) is True)
+
+print("\n== State migration from the REAL live file ==")
+# Byte-for-byte copy of seen_items.json as committed by ebay-monitor[bot] on
+# 2026-09-19T17:29Z. If the migration mishandles this, the monitor either
+# re-alerts on all 11 or goes permanently silent.
+LIVE_V1 = {
+    "version": 1,
+    "seen": {
+        "117418172426": "2026-09-18T16:00:20.768455+00:00",
+        "158300791099": "2026-09-18T16:00:20.768455+00:00",
+        "198644598436": "2026-09-18T16:00:20.768455+00:00",
+        "318867276875": "2026-09-18T16:00:20.768455+00:00",
+        "117417176775": "2026-09-18T16:00:20.768455+00:00",
+        "178508361397": "2026-09-18T21:36:22.366118+00:00",
+        "137752277767": "2026-09-18T21:36:22.366118+00:00",
+        "336800635027": "2026-09-19T01:34:05.359683+00:00",
+        "227528373054": "2026-09-19T06:35:39.416195+00:00",
+        "128085940061": "2026-09-19T11:30:34.357764+00:00",
+        "298690056229": "2026-09-19T17:29:20.923554+00:00",
+    },
+    "updated_at": "2026-09-19T17:29:20.923629+00:00",
+}
+
+with tempfile.TemporaryDirectory() as tmp:
+    p = Path(tmp) / "seen_items.json"
+    p.write_text(json.dumps(LIVE_V1, indent=2), "utf-8")
+    before_ids = set(LIVE_V1["seen"])
+
+    st = em.load_state(p)
+    check("all 11 real IDs survive the migration", set(st["seen"]) == before_ids,
+          f"{len(st['seen'])} of 11")
+    check("state version bumped to 2", st.get("version") == 2, str(st.get("version")))
+    check("each record is now a dict",
+          all(isinstance(v, dict) for v in st["seen"].values()))
+    check("first_seen timestamps preserved exactly",
+          st["seen"]["117418172426"]["first_seen"] == LIVE_V1["seen"]["117418172426"])
+    check("price starts as null, not guessed",
+          st["seen"]["298690056229"]["price"] is None)
+
+    em.save_state(p, st)
+    again = em.load_state(p)
+    check("migration is idempotent (re-loading changes nothing)",
+          set(again["seen"]) == before_ids and again["version"] == 2)
+    check("no listing is re-alerted after migration -- all still 'seen'",
+          all(i in again["seen"] for i in before_ids))
+
+    # The decisive one: poll the live search against the migrated real state.
+    args_mig = em.parse_args(["--once", "--dry-run", "--state-file", str(p)])
+    fresh_ids = [l.item_id for l in em.parse_listings(SLAMMED)
+                 if l.item_id not in again["seen"]]
+    check("the 2 known SLAMMED listings are recognised as already seen",
+          fresh_ids == [], str(fresh_ids))
+
+print("\n== Price-change events ==")
+base = em.Listing(item_id="x", title="Slammed SSP", url="u",
+                  price=100.0, price_text="$100.00", is_auction=False)
+
+
+def ev(old_price, new_price, crossed=False, threshold=45.0, title="Slammed SSP"):
+    """Replay run_cycle's event logic for one already-seen listing."""
+    rec = {"first_seen": "2026-09-01T00:00:00+00:00", "price": old_price,
+           "price_text": f"${old_price:,.2f}", "crossed": crossed}
+    l = em.Listing(item_id="x", title=title, url="u", price=new_price,
+                   price_text=f"${new_price:,.2f}", is_auction=False)
+    out = []
+    if l.price < rec["price"]:
+        drop = rec["price"] - l.price
+        pct = drop / rec["price"] * 100
+        if drop >= em.PRICE_DROP_MIN_ABS or pct >= em.PRICE_DROP_MIN_PCT:
+            out.append("drop")
+    if l.price >= threshold > rec["price"] and not rec["crossed"]:
+        out.append("crossed")
+    return out
+
+
+check("a $100 -> $60 drop alerts", ev(100.0, 60.0) == ["drop"], str(ev(100.0, 60.0)))
+check("a $100 -> $98 nudge does NOT alert", ev(100.0, 98.0) == [], str(ev(100.0, 98.0)))
+check("a small % drop on a big number still alerts ($5000 -> $4000)",
+      ev(5000.0, 4000.0) == ["drop"])
+check("a price RISE does not alert (auctions rise by design)",
+      ev(100.0, 150.0) == [], str(ev(100.0, 150.0)))
+check("a sub-floor auction crossing $45 alerts once",
+      ev(41.0, 46.0) == ["crossed"], str(ev(41.0, 46.0)))
+check("...and does not alert again once already crossed",
+      ev(41.0, 46.0, crossed=True) == [], str(ev(41.0, 46.0, crossed=True)))
+check("a rise that stays under the floor is silent", ev(20.0, 30.0) == [])
+
+print("\n== Search URL now excludes digital ==")
+check("default search excludes -digital", "-digital" in em.SEARCH_URL, em.SEARCH_URL)
+check("default search still excludes -slammer", "-slammer" in em.SEARCH_URL)
+check("default search still sorts newest first", "_sop=10" in em.SEARCH_URL)
+
 print("\n== Price parsing ==")
 cases = [
     ("$29.57", 29.57, 29.57),
@@ -262,8 +414,11 @@ class FakeClient:
         raise AssertionError(f"FakeClient got an unscripted {kind} request")
 
 
+_REAL_FETCHER = em.Fetcher   # captured now; tests monkeypatch em.Fetcher later
+
+
 def make_fetcher(script):
-    f = em.Fetcher.__new__(em.Fetcher)      # bypass __init__'s real client build
+    f = _REAL_FETCHER.__new__(_REAL_FETCHER)   # bypass __init__'s real client build
     f.kind = "requests"
     f.warmed_at = None
     f.warm_count = 0
@@ -321,12 +476,12 @@ f = make_fetcher([("home", FakeResponse(403)), ("search", FakeResponse(403)),
                   ("home", FakeResponse(403)), ("search", FakeResponse(403))])
 try:
     em.fetch_search_html(f, URL_OK)
-    check("a persistent block raises SoftBlockError after ONE retry", False,
-          "no exception")
+    check("a persistent block raises SoftBlockError once escalation is exhausted",
+          False, "no exception")
 except em.SoftBlockError as exc:
-    check("a persistent block raises SoftBlockError after ONE retry",
-          "re-warm" in str(exc), str(exc)[:70])
-check("it did not retry more than once",
+    check("a persistent block raises SoftBlockError once escalation is exhausted",
+          "every client" in str(exc), str(exc)[:70])
+check("the original client is tried exactly twice before escalating",
       f._client.calls == ["home", "search", "home", "search"], str(f._client.calls))
 
 # 5. Warm-up is reused between polls, but expires.
@@ -346,6 +501,92 @@ check("cookies present before reset", len(f._client.cookies) > 0)
 f.reset()
 check("reset clears the cookie jar", len(f._client.cookies) == 0)
 check("reset forces the next warm-up", not f.is_warm())
+
+print("\n== Escalation across clients when one IP gets blocked ==")
+em.RETRY_PAUSE = 0
+
+# requests blocked on both attempts; httpx then succeeds.
+made = []
+
+
+def fake_fetcher_factory(kind):
+    f = make_fetcher([("home", FakeResponse(403)),
+                      ("search", FakeResponse(200, GOOD_HTML))])
+    f.kind = kind
+    made.append(kind)
+    return f
+
+
+primary = make_fetcher([("home", FakeResponse(403)), ("search", FakeResponse(403)),
+                        ("home", FakeResponse(403)), ("search", FakeResponse(403))])
+real_cls = em.Fetcher
+em.Fetcher = fake_fetcher_factory
+try:
+    html = em.fetch_search_html(primary, URL_OK)
+    check("a blocked client escalates to the next one and recovers",
+          "ROMAN REIGNS" in html)
+    check("it escalated to httpx first", made[:1] == ["httpx"], str(made))
+except Exception as exc:
+    check("a blocked client escalates to the next one and recovers", False,
+          f"{type(exc).__name__}: {exc}")
+finally:
+    em.Fetcher = real_cls
+
+check("escalation order skips the client that just failed",
+      em._client_escalation("requests") == ["httpx", "curl_cffi"],
+      str(em._client_escalation("requests")))
+check("escalation order is correct from httpx too",
+      em._client_escalation("httpx") == ["requests", "curl_cffi"])
+
+# Everything blocked -> a clear terminal error.
+made.clear()
+
+
+def all_blocked_factory(kind):
+    f = make_fetcher([("home", FakeResponse(403)), ("search", FakeResponse(403))])
+    f.kind = kind
+    return f
+
+
+primary = make_fetcher([("home", FakeResponse(403)), ("search", FakeResponse(403)),
+                        ("home", FakeResponse(403)), ("search", FakeResponse(403))])
+em.Fetcher = all_blocked_factory
+try:
+    em.fetch_search_html(primary, URL_OK)
+    check("all clients blocked raises SoftBlockError", False, "no exception")
+except em.SoftBlockError as exc:
+    check("all clients blocked raises SoftBlockError", "every client" in str(exc),
+          str(exc)[:70])
+finally:
+    em.Fetcher = real_cls
+
+print("\n== Failure counter survives one-shot runs ==")
+with tempfile.TemporaryDirectory() as tmp:
+    path = Path(tmp) / "seen.json"
+    st = {"version": 1, "seen": {"a": "2026-09-18T00:00:00+00:00"}}
+    em.save_state(path, st)
+
+    # Simulate three separate --once processes each failing.
+    for i in (1, 2, 3):
+        s = em.load_state(path)
+        s["failures"] = int(s.get("failures", 0)) + 1
+        em.save_state(path, s)
+        check(f"failure {i} persisted across a fresh process",
+              em.load_state(path).get("failures") == i,
+              str(em.load_state(path).get("failures")))
+
+    final = em.load_state(path)
+    check("threshold of 3 is reached only on the third failure",
+          int(final["failures"]) >= 3)
+    check("a threshold of 2 would NOT have silently disabled alerting",
+          int(final["failures"]) >= 2)
+
+    final["failures"] = 0
+    final["health_alerted"] = False
+    em.save_state(path, final)
+    back = em.load_state(path)
+    check("recovery clears the counter", back.get("failures") == 0)
+    check("seen items are untouched by failure bookkeeping", "a" in back["seen"])
 
 print("\n== Client selection ==")
 check("auto prefers requests (the measured winner), not curl_cffi",
