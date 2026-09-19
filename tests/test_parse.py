@@ -471,9 +471,24 @@ except Exception as exc:
     check("HTTP 200 with no results markup is caught and retried (the curl_cffi case)",
           False, f"{type(exc).__name__}: {exc}")
 
-# 4. Genuinely blocked: give up after one retry rather than looping.
+# 4. Genuinely blocked: give up rather than looping.
+#
+# em.Fetcher MUST be patched here. Without it the escalation step constructs real
+# httpx / curl_cffi clients and makes live requests to eBay from inside the test
+# suite -- which passes locally only because those packages happen to be absent,
+# and does something different (and slow, and flaky) on CI where they're installed.
 f = make_fetcher([("home", FakeResponse(403)), ("search", FakeResponse(403)),
                   ("home", FakeResponse(403)), ("search", FakeResponse(403))])
+_saved_cls = em.Fetcher
+
+
+def _blocked_factory(kind):
+    alt = make_fetcher([("home", FakeResponse(403)), ("search", FakeResponse(403))])
+    alt.kind = kind
+    return alt
+
+
+em.Fetcher = _blocked_factory
 try:
     em.fetch_search_html(f, URL_OK)
     check("a persistent block raises SoftBlockError once escalation is exhausted",
@@ -481,8 +496,12 @@ try:
 except em.SoftBlockError as exc:
     check("a persistent block raises SoftBlockError once escalation is exhausted",
           "every client" in str(exc), str(exc)[:70])
+finally:
+    em.Fetcher = _saved_cls
 check("the original client is tried exactly twice before escalating",
       f._client.calls == ["home", "search", "home", "search"], str(f._client.calls))
+check("no test in this section touched the real network",
+      all(c in ("home", "search") for c in f._client.calls))
 
 # 5. Warm-up is reused between polls, but expires.
 f = make_fetcher([("home", FakeResponse(403)), ("search", FakeResponse(200, GOOD_HTML)),
