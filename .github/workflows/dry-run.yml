@@ -1,0 +1,56 @@
+# Branch-only safety net: run the NEW rules against the LIVE eBay search and show
+# exactly what they would have alerted on -- without sending anything to Discord.
+#
+# Two independent guarantees that nothing is sent:
+#   1. --dry-run is passed explicitly
+#   2. DISCORD_WEBHOOK_URL is deliberately NOT provided, so even without the flag
+#      the monitor would fall back to dry-run and print instead of posting
+#
+# It also never writes state: --dry-run skips the state save, so seen_items.json
+# is untouched and main's monitor is completely undisturbed.
+#
+# Manual trigger only. Schedules don't fire on non-default branches anyway.
+
+name: Dry run (new rules, live eBay, no Discord)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read          # cannot write to the repo even by accident
+
+jobs:
+  dryrun:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Offline test suite
+        run: python tests/test_parse.py
+
+      - name: Runner public IP
+        run: curl -s --max-time 15 https://ipinfo.io/json || echo "(unavailable)"
+
+      - name: What the NEW rules would alert on, against live eBay
+        run: |
+          echo "state file as committed on main:"
+          python -c "import json;d=json.load(open('seen_items.json'));print(' version',d.get('version'),'| items',len(d['seen']))"
+          echo
+          python ebay_monitor.py --once --dry-run --verbose-listings
+
+      - name: Confirm state was not modified
+        run: |
+          if [[ -n "$(git status --porcelain seen_items.json)" ]]; then
+            echo "::error::dry run modified seen_items.json -- it must not"
+            git --no-pager diff seen_items.json
+            exit 1
+          fi
+          echo "seen_items.json unchanged, as expected."
